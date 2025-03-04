@@ -45,7 +45,7 @@ struct arrival_t {
 struct display_item_t {
   int stopId;
   // number of arrivals currently in arrivals array
-  byte numArrivals;
+  byte arrivalCount;
   // the longest line refs I saw were 4 chars (LBUS, MBUS)
   char lineRef[4];
   char lineName[32];
@@ -101,6 +101,9 @@ Direction strToDirection(const char* directionString) {
 }
 
 Occupancy strToOccupancy(const char* occupancyString) {
+  if (occupancyString == nullptr) {
+    return UNKNOWN_OCCUPANCY;
+  }
   if (strcmp(occupancyString, "seatsAvailable") == 0) {
     return SEATS_AVAILABLE;
   }
@@ -122,7 +125,7 @@ time_t parseISOTimestamp(const char* timestamp) {
 void addArrivalToArray(JsonDocument arrival) {
   int stopId = atoi(arrival["MonitoringRef"]);
   const char* lineRef = arrival["MonitoredVehicleJourney"]["LineRef"];
-  const char* lineName = arrival["MonitoredVehicleJourney"]["OriginName"];
+  const char* lineName = arrival["MonitoredVehicleJourney"]["PublishedLineName"];
   Direction direction = strToDirection(arrival["MonitoredVehicleJourney"]["DirectionRef"]);
   const char* destination = arrival["MonitoredVehicleJourney"]["DestinationName"];
 
@@ -139,7 +142,7 @@ void addArrivalToArray(JsonDocument arrival) {
       && direction == displayItem->direction
     ) {
       // we found a matching struct
-      if (displayItem->numArrivals == (sizeof(displayItem->arrivals) / sizeof(arrival_t))) {
+      if (displayItem->arrivalCount == (sizeof(displayItem->arrivals) / sizeof(arrival_t))) {
         // we already have the max number of arrivals in our array, so just ignore this
         return;
       }
@@ -158,26 +161,29 @@ void addArrivalToArray(JsonDocument arrival) {
     }
 
     // otherwise, initialize a new display item to add it to
+    
     displayItemToAddArrivalTo = &displayItems[displayItemCount];
+    
     displayItemToAddArrivalTo->stopId = stopId;
     strlcpy(displayItemToAddArrivalTo->destination, destination, sizeof(displayItemToAddArrivalTo->destination));
     strlcpy(displayItemToAddArrivalTo->lineRef, lineRef, sizeof(displayItemToAddArrivalTo->lineRef));
     strlcpy(displayItemToAddArrivalTo->lineName, lineName, sizeof(displayItemToAddArrivalTo->lineName));
     displayItemToAddArrivalTo->direction = direction;
-    displayItemToAddArrivalTo->numArrivals = 0;
+    displayItemToAddArrivalTo->arrivalCount = 0;
     displayItemCount++;
   }
   
   // add this arrival to the array
   const char* arrivalTimeStr = arrival["MonitoredVehicleJourney"]["MonitoredCall"]["ExpectedArrivalTime"];
 
-  displayItemToAddArrivalTo->arrivals[displayItemToAddArrivalTo->numArrivals].occupancy = strToOccupancy(arrival["MonitoredVehicleJourney"]["Occupancy"]);
-  displayItemToAddArrivalTo->arrivals[displayItemToAddArrivalTo->numArrivals].expectedArrivalTime = parseISOTimestamp(arrivalTimeStr);
-  displayItemToAddArrivalTo->numArrivals++;
+  displayItemToAddArrivalTo->arrivals[displayItemToAddArrivalTo->arrivalCount].occupancy = strToOccupancy(arrival["MonitoredVehicleJourney"]["Occupancy"]);
+  displayItemToAddArrivalTo->arrivals[displayItemToAddArrivalTo->arrivalCount].expectedArrivalTime = parseISOTimestamp(arrivalTimeStr);
+  displayItemToAddArrivalTo->arrivalCount++;
 }
 
 void renderScreen() {
-  display.printf("Battery: %.2f V, WiFi: %d dBm", display.readBattery(), WiFi.RSSI());
+  display.setTextSize(4);
+  display.printf("Battery: %.2f V, WiFi: %d dBm\n", display.readBattery(), WiFi.RSSI());
   time_t now = display.rtcGetEpoch();
   // TODO: replace this with something remotely pleasant to look at
   for (int i = 0; i < displayItemCount; i++) {
@@ -188,10 +194,9 @@ void renderScreen() {
     display.print(") towards ");
     display.println(displayItem->destination);
 
-    display.print("    ");
-
-    for (int j = 0; j < displayItem->numArrivals; j++) {
+    for (int j = 0; j < displayItem->arrivalCount; j++) {
       arrival_t* arrival = &displayItem->arrivals[j];
+      display.print("    ");
       display.print((arrival->expectedArrivalTime - now) / 60);
       display.print(" min ");
       switch (arrival->occupancy) {
@@ -232,6 +237,34 @@ void setTimeFromNTP() {
   display.rtcSetEpoch(timeClient.getEpochTime());
 }
 
+int compareDisplayItems(const void* displayItemAVoid, const void* displayItemBVoid) {
+  display_item_t* displayItemA = (display_item_t*)displayItemAVoid;
+  display_item_t* displayItemB = (display_item_t*)displayItemBVoid;
+  // sort display items by stop ID, then by line, then by direction
+  // sort arrivals in each display item by soonest first
+  int stopIdDiff = displayItemA->stopId - displayItemB->stopId;
+  if (stopIdDiff != 0) {
+    return stopIdDiff;
+  }
+  int lineDiff = strcmp((const char*)&displayItemA->lineRef, (const char*)&displayItemB->lineRef);
+  if (lineDiff != 0) {
+    return lineDiff;
+  }
+  return displayItemA->direction - displayItemB->direction;
+}
+
+int compareArrivals(const void* arrivalA, const void* arrivalB) {
+  return ((arrival_t*)arrivalA)->expectedArrivalTime - ((arrival_t*)arrivalB)->expectedArrivalTime;
+}
+
+void sortDisplayItems() {
+  qsort(&displayItems, displayItemCount, sizeof(display_item_t), compareDisplayItems);
+  for (int i = 0; i < displayItemCount; i++) {
+    display_item_t* item = &displayItems[i];
+    qsort(item->arrivals, item->arrivalCount, sizeof(arrival_t), compareArrivals);
+  }
+}
+
 void setAlarmForNextUpdate() {
   time_t currentTime = display.rtcGetEpoch();
   tm* timeStruct = gmtime(&currentTime);
@@ -244,6 +277,8 @@ void setAlarmForNextUpdate() {
 void setup() {
   display.begin();
   Serial.begin(9600);
+
+  Serial.printf("clock speed is %d MHz\n", getCpuFrequencyMhz());
 
   // check if we just woke up from deep sleep
   if (rtc_get_reset_reason(0) == DEEPSLEEP_RESET) {
@@ -269,13 +304,16 @@ void setup() {
 
   setTimeFromNTP();
 
+  http.useHTTP10(true);
   http.begin(API_URL);
-  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("Accept-Encoding", "identity", true, true);
   int responseCode = http.GET();
+
+  int startTime = display.rtcGetEpoch();
 
   if (responseCode == HTTP_CODE_OK) {
     WiFiClient payloadStream = http.getStream();
-    ReadBufferingStream bufferedPayload(payloadStream, 64);
+    ReadBufferingStream bufferedPayload(payloadStream, 256);
     Serial.println("Received repsonse, parsing...");
     // seek to the start of the main array
     bufferedPayload.find("\"MonitoredStopVisit\":[");
@@ -291,10 +329,12 @@ void setup() {
         addArrivalToArray(currentArrival);
       }
       numArrivalsDeserialized++;
-      if (numArrivalsDeserialized % 10 == 0) {
-        Serial.printf("Deserialized %d arrivals so far", numArrivalsDeserialized);
+      if (numArrivalsDeserialized % 100 == 0) {
+        Serial.printf("Deserialized %d arrivals so far\n", numArrivalsDeserialized);
       }
     } while (bufferedPayload.findUntil(",", "]"));
+
+    sortDisplayItems();
 
     // displayItems is now fully populated, render the screen
     renderScreen();
@@ -303,6 +343,8 @@ void setup() {
     Serial.print(responseCode);
   }
   WiFi.disconnect();
+
+  Serial.printf("did the real work in %d seconds\n", display.rtcGetEpoch() - startTime);
   
   setAlarmForNextUpdate();
 
