@@ -8,6 +8,8 @@
 #include <rom/rtc.h>       // Include ESP32 library for RTC (needed for rtc_get_reset_reason() function)
 
 #include "config.h"
+#include "globals.h"
+#include "render.h"
 
 #define API_URL_BASE "http://192.168.1.96:42424/transit/StopMonitoring?agency=SF&api_key="
 #define API_URL API_URL_BASE API_KEY
@@ -15,55 +17,19 @@
 
 #define MAX_PARTIAL_UPDATES 5
 
-Inkplate display(INKPLATE_1BIT);
-HTTPClient http;
-WiFiUDP ntpUDP;
-NTPClient timeClient(ntpUDP);
-StaticJsonDocument<144> filter;
-
-enum Occupancy {
-  SEATS_AVAILABLE,
-  STANDING_AVAILABLE,
-  FULL,
-  // this is for cable cars, etc that don't measure occupancy
-  UNKNOWN_OCCUPANCY,
-};
-
-enum Direction {
-  INBOUND,
-  OUTBOUND,
-  WEST,
-  SOUTH,
-  EAST,
-  NORTH,
-  // i only saw the above 6 in the data, but handle other cases gracefully
-  UNKNOWN_DIRECTION,
-};
-
-struct arrival_t {
-  time_t expectedArrivalTime;
-  Occupancy occupancy;
-};
-
-struct display_item_t {
-  int stopId;
-  // number of arrivals currently in arrivals array
-  byte arrivalCount;
-  // the longest line refs I saw were 4 chars (LBUS, MBUS)
-  char lineRef[4];
-  char lineName[32];
-  Direction direction;
-  // should be long enough for most destinations, at least.
-  char destination[32];
-  arrival_t arrivals[3];
-};
-
 RTC_DATA_ATTR display_item_t displayItems[20];
 RTC_DATA_ATTR byte displayItemCount;
 RTC_DATA_ATTR time_t renderTime;
 RTC_DATA_ATTR float batteryVoltage;
 RTC_DATA_ATTR int rssi;
 RTC_DATA_ATTR byte numPartialUpdatesSinceClear;
+
+Inkplate display(INKPLATE_1BIT);
+
+HTTPClient http;
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
+StaticJsonDocument<144> filter;
 
 String concatInts(const int* ints, size_t size) {
   char** strings = (char**)malloc(size * sizeof(char*));
@@ -216,46 +182,6 @@ void addArrivalToArray(JsonDocument arrival) {
   displayItemToAddArrivalTo->arrivalCount++;
 }
 
-void renderScreen() {
-  // WARNING: all variables used in this function _must_ be saved to RTC RAM to ensure
-  // partial updates work!
-  display.setCursor(0, 0);
-  display.setTextSize(4);
-  display.printf("Time: %d\n", renderTime);
-  Serial.printf("Drawing %d display items\n", displayItemCount);
-  //display.printf("Battery: %.2f V, WiFi: %d dBm\n", display.readBattery(), WiFi.RSSI());
-  // TODO: replace this with something remotely pleasant to look at
-  for (int i = 0; i < displayItemCount; i++) {
-    display_item_t* displayItem = &displayItems[i];
-    display.print(displayItem->lineRef);
-    display.print(" (");
-    display.print(displayItem->lineName);
-    display.print(") towards ");
-    display.println(displayItem->destination);
-
-    for (int j = 0; j < displayItem->arrivalCount; j++) {
-      arrival_t* arrival = &displayItem->arrivals[j];
-      display.print("    ");
-      display.print((arrival->expectedArrivalTime - renderTime) / 60);
-      display.print(" min ");
-      switch (arrival->occupancy) {
-        case FULL:
-          display.print("(full)");
-          break;
-        case STANDING_AVAILABLE:
-          display.print("(standing)");
-          break;
-        case SEATS_AVAILABLE:
-          display.print("(seats)");
-          break;
-        default:
-          display.print("(unknown)");
-      }
-      display.println();
-    }
-  }
-}
-
 void setupJSONFilter() {
   filter["MonitoringRef"] = true;
 
@@ -278,6 +204,7 @@ void updateDisplayGlobals() {
   rssi = WiFi.RSSI();
   batteryVoltage = display.readBattery();
   renderTime = display.rtcGetEpoch();
+  Serial.println(renderTime);
 }
 
 int compareDisplayItems(const void* displayItemAVoid, const void* displayItemBVoid) {
@@ -318,6 +245,10 @@ void setAlarmForNextUpdate() {
   Serial.printf("See ya in %d seconds!\n", alarmTime - currentTime);
 }
 
+void callRenderFn() {
+  renderScreen(&display, &displayItems, displayItemCount, renderTime);
+}
+
 void setup() {
   display.begin();
   Serial.begin(9600);
@@ -330,13 +261,10 @@ void setup() {
     if (numPartialUpdatesSinceClear < MAX_PARTIAL_UPDATES) {
       Serial.println("Preloading screen to prepare for partial update");
       // draw what we drew last time to memory
-      renderScreen();
+      callRenderFn();
       // tell the screen code that the stuff we just drew to memory
       // is the same thing as it already has on screen
       display.preloadScreen();
-      // now that the buffer contains the old screen data, clear it
-      // so we can write a new screen to it
-      display.clearDisplay();
       shouldPartialUpdate = true;
     }
   }
@@ -366,9 +294,9 @@ void setup() {
   String stopFilter = concatInts(STOP_IDS, sizeof(STOP_IDS) / sizeof(int));
   String lineFilter = concatStrings(LINE_REFS, sizeof(LINE_REFS) / sizeof(char*));
   // should be long enough
-  char URL[512];
-  snprintf(URL, sizeof(URL), "%s&stopcodes=%s&line_ids=%s", API_URL, stopFilter, lineFilter);
-  Serial.println(URL);
+  size_t urlSize = 512 * sizeof(char);
+  char* URL = (char*)malloc(urlSize);
+  snprintf(URL, urlSize, "%s&stopcodes=%s&line_ids=%s", API_URL, stopFilter, lineFilter);
   http.begin(URL);
   http.addHeader("Accept-Encoding", "identity", true, true);
   int responseCode = http.GET();
@@ -376,6 +304,7 @@ void setup() {
   int startTime = display.rtcGetEpoch();
 
   if (responseCode == HTTP_CODE_OK) {
+    // TODO: gather headers, make sure x-filtered-visit-count > 0
     WiFiClient payloadStream = http.getStream();
     ReadBufferingStream bufferedPayload(payloadStream, 256);
     Serial.println("Received repsonse, parsing...");
@@ -403,7 +332,7 @@ void setup() {
     // save battery, time, wifi signal to RTC ram so we can partial update on it
     updateDisplayGlobals();
     // displayItems is now fully populated, render the screen
-    renderScreen();
+    callRenderFn();
 
     if (shouldPartialUpdate) {
       Serial.println("Doing partial update");
@@ -415,7 +344,7 @@ void setup() {
     }
   } else {
     Serial.print("Got HTTP error: ");
-    Serial.print(responseCode);
+    Serial.println(responseCode);
   }
   WiFi.disconnect();
 
@@ -424,6 +353,7 @@ void setup() {
   setAlarmForNextUpdate();
 
   Serial.flush();
+  free(URL);
 
   // Enable wakeup from deep sleep on gpio 39 where RTC interrupt is connected
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
