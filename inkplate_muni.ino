@@ -9,8 +9,11 @@
 
 #include "config.h"
 
-#define API_URL_BASE "http://api.511.org/transit/StopMonitoring?agency=SF&format=json&api_key="
+#define API_URL_BASE "http://192.168.1.96:42424/transit/StopMonitoring?agency=SF&api_key="
 #define API_URL API_URL_BASE API_KEY
+#define API_DELIMITER "|"
+
+#define MAX_PARTIAL_UPDATES 5
 
 Inkplate display(INKPLATE_1BIT);
 HTTPClient http;
@@ -55,9 +58,41 @@ struct display_item_t {
   arrival_t arrivals[3];
 };
 
-// TODO: bigger? smaller?
 RTC_DATA_ATTR display_item_t displayItems[20];
-RTC_DATA_ATTR byte displayItemCount = 0;
+RTC_DATA_ATTR byte displayItemCount;
+RTC_DATA_ATTR time_t renderTime;
+RTC_DATA_ATTR float batteryVoltage;
+RTC_DATA_ATTR int rssi;
+RTC_DATA_ATTR byte numPartialUpdatesSinceClear;
+
+String concatInts(const int* ints, size_t size) {
+  char** strings = (char**)malloc(size * sizeof(char*));
+  for (int i = 0; i < size; i++) {
+    char tmp[8];
+    itoa(ints[i], tmp, 10);
+    char* string = strdup(tmp);
+    strcpy(string, tmp);
+    strings[i] = string;
+  }
+  String output = concatStrings((const char**)strings, size);
+  for (int i = 0; i < size; i++) {
+    free(strings[i]);
+  }
+  free(strings);
+  return output;
+}
+
+String concatStrings(const char** strings, size_t size) {
+  String out;
+  for (int i = 0; i < size; i++) {
+    const char* currentString = strings[i];
+    out += currentString;
+    if (i != size - 1) {
+      out += API_DELIMITER;
+    }
+  }
+  return out;
+}
 
 bool stopIsDesired(const char* stopStr) {
   int stop = atoi(stopStr);
@@ -182,9 +217,13 @@ void addArrivalToArray(JsonDocument arrival) {
 }
 
 void renderScreen() {
+  // WARNING: all variables used in this function _must_ be saved to RTC RAM to ensure
+  // partial updates work!
+  display.setCursor(0, 0);
   display.setTextSize(4);
-  display.printf("Battery: %.2f V, WiFi: %d dBm\n", display.readBattery(), WiFi.RSSI());
-  time_t now = display.rtcGetEpoch();
+  display.printf("Time: %d\n", renderTime);
+  Serial.printf("Drawing %d display items\n", displayItemCount);
+  //display.printf("Battery: %.2f V, WiFi: %d dBm\n", display.readBattery(), WiFi.RSSI());
   // TODO: replace this with something remotely pleasant to look at
   for (int i = 0; i < displayItemCount; i++) {
     display_item_t* displayItem = &displayItems[i];
@@ -197,7 +236,7 @@ void renderScreen() {
     for (int j = 0; j < displayItem->arrivalCount; j++) {
       arrival_t* arrival = &displayItem->arrivals[j];
       display.print("    ");
-      display.print((arrival->expectedArrivalTime - now) / 60);
+      display.print((arrival->expectedArrivalTime - renderTime) / 60);
       display.print(" min ");
       switch (arrival->occupancy) {
         case FULL:
@@ -215,8 +254,6 @@ void renderScreen() {
       display.println();
     }
   }
-
-  display.partialUpdate();
 }
 
 void setupJSONFilter() {
@@ -235,6 +272,12 @@ void setTimeFromNTP() {
   timeClient.begin();
   timeClient.update();
   display.rtcSetEpoch(timeClient.getEpochTime());
+}
+
+void updateDisplayGlobals() {
+  rssi = WiFi.RSSI();
+  batteryVoltage = display.readBattery();
+  renderTime = display.rtcGetEpoch();
 }
 
 int compareDisplayItems(const void* displayItemAVoid, const void* displayItemBVoid) {
@@ -272,26 +315,41 @@ void setAlarmForNextUpdate() {
   timeStruct->tm_min += 1;
   time_t alarmTime = mktime(timeStruct);
   display.rtcSetAlarmEpoch(alarmTime, RTC_ALARM_MATCH_DHHMMSS);
+  Serial.printf("See ya in %d seconds!\n", alarmTime - currentTime);
 }
 
 void setup() {
   display.begin();
   Serial.begin(9600);
 
-  Serial.printf("clock speed is %d MHz\n", getCpuFrequencyMhz());
-
+  bool shouldPartialUpdate = false;
+  Serial.println("Initting...");
   // check if we just woke up from deep sleep
   if (rtc_get_reset_reason(0) == DEEPSLEEP_RESET) {
-    Serial.println("eepy");
+    Serial.println("Resuming from deep sleep.");
+    if (numPartialUpdatesSinceClear < MAX_PARTIAL_UPDATES) {
+      Serial.println("Preloading screen to prepare for partial update");
+      // draw what we drew last time to memory
+      renderScreen();
+      // tell the screen code that the stuff we just drew to memory
+      // is the same thing as it already has on screen
+      display.preloadScreen();
+      // now that the buffer contains the old screen data, clear it
+      // so we can write a new screen to it
+      display.clearDisplay();
+      shouldPartialUpdate = true;
+    }
   }
-  // TODO: partial update
-  display.clearDisplay();
+  if (!shouldPartialUpdate) {
+    Serial.println("Doing a full update");
+    numPartialUpdatesSinceClear = 0;
+  }
 
   setupJSONFilter();
   display.rtcClearAlarmFlag();
 
   // clear out any old/garbage data in RTC memory
-  // TODO: only do this on fresh boot, not wake from sleep
+  // we've already preloaded the screen, so we don't need this anymore
   memset(displayItems, 0, sizeof(displayItems));
   displayItemCount = 0;
 
@@ -305,7 +363,13 @@ void setup() {
   setTimeFromNTP();
 
   http.useHTTP10(true);
-  http.begin(API_URL);
+  String stopFilter = concatInts(STOP_IDS, sizeof(STOP_IDS) / sizeof(int));
+  String lineFilter = concatStrings(LINE_REFS, sizeof(LINE_REFS) / sizeof(char*));
+  // should be long enough
+  char URL[512];
+  snprintf(URL, sizeof(URL), "%s&stopcodes=%s&line_ids=%s", API_URL, stopFilter, lineFilter);
+  Serial.println(URL);
+  http.begin(URL);
   http.addHeader("Accept-Encoding", "identity", true, true);
   int responseCode = http.GET();
 
@@ -336,17 +400,30 @@ void setup() {
 
     sortDisplayItems();
 
+    // save battery, time, wifi signal to RTC ram so we can partial update on it
+    updateDisplayGlobals();
     // displayItems is now fully populated, render the screen
     renderScreen();
+
+    if (shouldPartialUpdate) {
+      Serial.println("Doing partial update");
+      display.partialUpdate(true);
+      numPartialUpdatesSinceClear++;
+    } else {
+      Serial.println("Doing full update");
+      display.display();
+    }
   } else {
     Serial.print("Got HTTP error: ");
     Serial.print(responseCode);
   }
   WiFi.disconnect();
 
-  Serial.printf("did the real work in %d seconds\n", display.rtcGetEpoch() - startTime);
+  Serial.printf("Downloaded and processed JSON in %d seconds\n", display.rtcGetEpoch() - startTime);
   
   setAlarmForNextUpdate();
+
+  Serial.flush();
 
   // Enable wakeup from deep sleep on gpio 39 where RTC interrupt is connected
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
