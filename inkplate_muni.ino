@@ -198,6 +198,22 @@ void setTimeFromNTP() {
   timeClient.begin();
   timeClient.update();
   display.rtcSetEpoch(timeClient.getEpochTime());
+
+  configTime(0, 0, "pool.ntp.org");
+  setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+  tzset();
+
+  time_t now;
+  time(&now);
+  time_t local;
+  localtime(&now);
+  Serial.printf("RTC time: %d / time() time: %d / localtime() time: %d\n", display.rtcGetEpoch(), now, local);
+
+  // TODO: possible this is correct, but i need to wait a bit for it to sync
+  time_t timeEpoch;
+  tm t;
+  display.getNTPEpoch(&timeEpoch, -8);
+  Serial.println(gmtime_r(&timeEpoch, &t));
 }
 
 void updateDisplayGlobals() {
@@ -246,7 +262,7 @@ void setAlarmForNextUpdate() {
 }
 
 void callRenderFn() {
-  renderScreen(&display, &displayItems, displayItemCount, renderTime);
+  renderScreen(&display, &displayItems, displayItemCount, renderTime, batteryVoltage, rssi);
 }
 
 void setup() {
@@ -299,6 +315,7 @@ void setup() {
   snprintf(URL, urlSize, "%s&stopcodes=%s&line_ids=%s", API_URL, stopFilter, lineFilter);
   http.begin(URL);
   http.addHeader("Accept-Encoding", "identity", true, true);
+  http.setTimeout(30 * 1000);
   int responseCode = http.GET();
 
   int startTime = display.rtcGetEpoch();
@@ -343,8 +360,7 @@ void setup() {
       display.display();
     }
   } else {
-    Serial.print("Got HTTP error: ");
-    Serial.println(responseCode);
+    Serial.printf("Got HTTP error: %s\n", http.errorToString(responseCode));
   }
   WiFi.disconnect();
 
