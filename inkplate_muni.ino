@@ -11,7 +11,7 @@
 #include "globals.h"
 #include "render.h"
 
-#define API_URL_BASE "http://192.168.1.96:42424/transit/StopMonitoring?agency=SF&api_key="
+#define API_URL_BASE "http://511proxy.wn.zone/transit/StopMonitoring?agency=SF&api_key="
 #define API_URL API_URL_BASE API_KEY
 #define API_DELIMITER "|"
 
@@ -23,6 +23,8 @@ RTC_DATA_ATTR time_t renderTime;
 RTC_DATA_ATTR float batteryVoltage;
 RTC_DATA_ATTR int rssi;
 RTC_DATA_ATTR byte numPartialUpdatesSinceClear;
+// TODO: use this
+RTC_DATA_ATTR time_t lastNTPSync;
 
 Inkplate display(INKPLATE_1BIT);
 
@@ -117,10 +119,23 @@ Occupancy strToOccupancy(const char* occupancyString) {
   return UNKNOWN_OCCUPANCY;
 }
 
+// chatgpt wizardry to make up for the lack of timegm
 time_t parseISOTimestamp(const char* timestamp) {
-  tm timeStruct;
-  strptime(timestamp, "%FT%T%z", &timeStruct);
-  return mktime(&timeStruct);
+  struct tm timeStruct = {};
+  
+  // Parse the ISO 8601 time string (assuming UTC because of "Z")
+  strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ", &timeStruct);
+
+  // Convert to time_t (this assumes local time)
+  time_t localEpoch = mktime(&timeStruct);
+
+  // Get the true UTC offset at that moment
+  struct tm localTime = *localtime(&localEpoch);
+  struct tm utcTime = *gmtime(&localEpoch);
+  time_t timezoneOffset = difftime(mktime(&localTime), mktime(&utcTime));
+
+  // Adjust back to true UTC
+  return localEpoch + timezoneOffset;
 }
 
 void addArrivalToArray(JsonDocument arrival) {
@@ -195,32 +210,28 @@ void setupJSONFilter() {
 }
 
 void setTimeFromNTP() {
+  // TODO: only update time once ~daily
   timeClient.begin();
   timeClient.update();
-  display.rtcSetEpoch(timeClient.getEpochTime());
 
-  configTime(0, 0, "pool.ntp.org");
+  // https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
   setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
   tzset();
 
-  time_t now;
-  time(&now);
-  time_t local;
-  localtime(&now);
-  Serial.printf("RTC time: %d / time() time: %d / localtime() time: %d\n", display.rtcGetEpoch(), now, local);
+  display.rtcSetEpoch(timeClient.getEpochTime());
 
-  // TODO: possible this is correct, but i need to wait a bit for it to sync
-  time_t timeEpoch;
-  tm t;
-  display.getNTPEpoch(&timeEpoch, -8);
-  Serial.println(gmtime_r(&timeEpoch, &t));
+  time_t now = display.rtcGetEpoch();
+  tm* local = localtime(&now);
+  char timeStr[10];
+  strftime(timeStr, 10, "%I:%M %p", local);
+
+  Serial.printf("RTC time %d / local time: %s\n", display.rtcGetEpoch(), timeStr);
 }
 
 void updateDisplayGlobals() {
   rssi = WiFi.RSSI();
   batteryVoltage = display.readBattery();
   renderTime = display.rtcGetEpoch();
-  Serial.println(renderTime);
 }
 
 int compareDisplayItems(const void* displayItemAVoid, const void* displayItemBVoid) {
@@ -252,13 +263,16 @@ void sortDisplayItems() {
 }
 
 void setAlarmForNextUpdate() {
+  display.rtcGetRtcData();
+  // clear any old timers that may have been set before
+  display.rtcDisableTimer();
   time_t currentTime = display.rtcGetEpoch();
-  tm* timeStruct = gmtime(&currentTime);
+  tm* timeStruct = localtime(&currentTime);
   timeStruct->tm_sec = 0;
   timeStruct->tm_min += 1;
   time_t alarmTime = mktime(timeStruct);
   display.rtcSetAlarmEpoch(alarmTime, RTC_ALARM_MATCH_DHHMMSS);
-  Serial.printf("See ya in %d seconds!\n", alarmTime - currentTime);
+  Serial.printf("See ya in %d seconds! alarm: %d, current: %d\n", alarmTime - currentTime, alarmTime, currentTime);
 }
 
 void callRenderFn() {
@@ -324,7 +338,7 @@ void setup() {
     // TODO: gather headers, make sure x-filtered-visit-count > 0
     WiFiClient payloadStream = http.getStream();
     ReadBufferingStream bufferedPayload(payloadStream, 256);
-    Serial.println("Received repsonse, parsing...");
+    Serial.println("Received response, parsing...");
     // seek to the start of the main array
     bufferedPayload.find("\"MonitoredStopVisit\":[");
     StaticJsonDocument<512> currentArrival;
@@ -373,6 +387,10 @@ void setup() {
 
   // Enable wakeup from deep sleep on gpio 39 where RTC interrupt is connected
   esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
+
+  // Enable wakeup from deep sleep on gpio 36 (wake button)
+  // TODO: seems like only one wakeup source can be enabled at a time
+  //esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, LOW);
 
   // Go to sleep
   esp_deep_sleep_start();
