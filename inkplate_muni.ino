@@ -36,6 +36,11 @@ WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP);
 StaticJsonDocument<144> filter;
 
+// we decide this once per render so we don't render a normal update,
+// then sleep for 8 hours because the time rolled over into the night period
+// while we rendered the normal update
+bool isNight;
+
 String concatInts(const int* ints, size_t size) {
   char** strings = (char**)malloc(size * sizeof(char*));
   for (int i = 0; i < size; i++) {
@@ -277,9 +282,6 @@ void sortDisplayItems() {
 }
 
 void setAlarmForNextUpdate() {
-  // isNightTime uses localtime(), which overwrites a _global tm struct_ for some reason
-  // make sure to run it before we start doing time math below so we don't get mixed up
-  bool isNight = isNightTime();
   display.rtcGetRtcData();
   // clear any old timers that may have been set before
   display.rtcDisableTimer();
@@ -299,7 +301,7 @@ void setAlarmForNextUpdate() {
   int timeToSleep = alarmTime - currentTime;
   if (timeToSleep < 0) {
     timeToSleep = 10;
-  } else if (timeToSleep > 60 && !isNightTime()) {
+  } else if (timeToSleep > 60 && !isNight) {
     timeToSleep = 60;
   }
   // using this function instead of display.rtcSetAlarm() doesn't use the ext0 wakeup slot,
@@ -369,7 +371,9 @@ void setup() {
     numPartialUpdatesSinceClear = 0;
   }
 
-  if (isNightTime()) {
+  isNight = isNightTime();
+
+  if (isNight) {
     display.setDisplayMode(INKPLATE_3BIT);
     renderSleepImage(&display);
     display.display();
