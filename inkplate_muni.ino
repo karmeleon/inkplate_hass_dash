@@ -212,11 +212,7 @@ void setupJSONFilter() {
   filter_MonitoredVehicleJourney["MonitoredCall"]["ExpectedArrivalTime"] = true;
 }
 
-void initTime() {
-  // https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
-  setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
-  tzset();
-
+void maybeUpdateTimeFromNTP() {
   if (!display.rtcIsSet() || display.rtcGetEpoch() - lastNTPSync > (60 * 60 * 24)) {
     Serial.println("Setting clock from NTP");
     timeClient.begin();
@@ -231,6 +227,12 @@ void initTime() {
       Serial.println("Couldn't fetch time from NTP, trying again next cycle.");
     }
   }
+}
+
+void initTime() {
+  // https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
+  setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
+  tzset();
 
   time_t now = display.rtcGetEpoch();
   tm* local = localtime(&now);
@@ -275,13 +277,16 @@ void sortDisplayItems() {
 }
 
 void setAlarmForNextUpdate() {
+  // isNightTime uses localtime(), which overwrites a _global tm struct_ for some reason
+  // make sure to run it before we start doing time math below so we don't get mixed up
+  bool isNight = isNightTime();
   display.rtcGetRtcData();
   // clear any old timers that may have been set before
   display.rtcDisableTimer();
   time_t currentTime = display.rtcGetEpoch();
   tm* timeStruct = localtime(&currentTime);
 
-  if (isNightTime()) {
+  if (isNight) {
     // this assumes that the night starts and ends on the same calendar day
     timeStruct->tm_sec = 0;
     timeStruct->tm_min = 0;
@@ -294,13 +299,13 @@ void setAlarmForNextUpdate() {
   int timeToSleep = alarmTime - currentTime;
   if (timeToSleep < 0) {
     timeToSleep = 10;
-  } else if (timeToSleep > 60) {
+  } else if (timeToSleep > 60 && !isNightTime()) {
     timeToSleep = 60;
   }
   // using this function instead of display.rtcSetAlarm() doesn't use the ext0 wakeup slot,
   // so we can wake up by either timer or the wake button on the device
   esp_sleep_enable_timer_wakeup(timeToSleep * uS_TO_S_FACTOR);
-  Serial.printf("See ya in %d seconds! alarm: %d, current: %d\n", alarmTime - currentTime, alarmTime, currentTime);
+  Serial.printf("See ya in %d seconds! alarm: %d, current: %d\n", timeToSleep, alarmTime, currentTime);
 }
 
 void callRenderFn() {
@@ -342,6 +347,7 @@ void setup() {
   setCpuFrequencyMhz(80);
   display.setDisplayMode(INKPLATE_1BIT);
   display.setRotation(3);
+  initTime();
 
   bool shouldPartialUpdate = false;
   Serial.println("Initting...");
@@ -397,8 +403,7 @@ void setup() {
   }
   Serial.println(" connected!");
 
-  // this occasionally pulls time fron NTP, so don't run it before we have a wifi connection
-  initTime();
+  maybeUpdateTimeFromNTP();
 
   // use http 1.0 so that the HTTP library doesn't add its own (broken) Accept-Encoding header
   http.useHTTP10(true);
