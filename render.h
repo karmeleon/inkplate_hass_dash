@@ -4,6 +4,8 @@
 #include "fonts/OpenSansSemiBold96pt7b.h"
 #include "fonts/OpenSansRegular48pt7b.h"
 #include "fonts/OpenSansSemiBold24pt7b.h"
+#include "fonts/Cheltenham_Condensed_Bold_Italic24pt7b.h"
+#include "img.h"
 
 #define SCREEN_HEIGHT 800
 #define SCREEN_WIDTH 600
@@ -12,8 +14,6 @@
 #define CAPSULE_HEIGHT 115
 
 #define ITEMS_ON_SCREEN 4
-
-// default text size is 5px * 7px, setTextSize(x) multiplies height + width by that factor
 
 // font, color, and size should be set before calling this fn
 void drawCenteredText(Inkplate* displayPtr, short centerX, short centerY, const char* content, bool customFont) {
@@ -57,7 +57,7 @@ void renderArrivalDetails(Inkplate* displayPtr, arrival_t* arrivalPtr, short x, 
   }
 
   displayPtr->drawRoundRect(x, y, 35, CAPSULE_HEIGHT, 5, BLACK);
-  displayPtr->fillRoundRect(x, y - (CAPSULE_HEIGHT - fillHeight), 35, fillHeight, 5, BLACK);
+  displayPtr->fillRoundRect(x, y + (CAPSULE_HEIGHT - fillHeight), 35, fillHeight, 5, BLACK);
   
   // draw arrival time
   displayPtr->setTextSize(1);
@@ -103,6 +103,7 @@ void renderStatusBar(Inkplate* displayPtr, time_t renderTime, float batteryVolta
   strftime(timeStr, 10, "%I:%M %p", localTime);
   displayPtr->print(timeStr);
 
+  // TODO: calculate a rough battery percentage and display either it or a lil battery icon
   displayPtr->setCursor(SCREEN_WIDTH - 110, STATUS_BAR_HEIGHT - 5);
   displayPtr->printf("%1.2f V", batteryVoltage);
   displayPtr->setFont(NULL);
@@ -114,7 +115,7 @@ void renderScreen(Inkplate* displayPtr, display_item_t (* displayItemsPtr)[20], 
   // WARNING: all variables used in this function _must_ be saved to RTC RAM to ensure
   // partial updates work!
   displayPtr->clearDisplay();
-  displayPtr->setRotation(3);
+  
   displayPtr->setCursor(0, 0);
   
   Serial.printf("Drawing %d display items\n", displayItemCount);
@@ -124,4 +125,16 @@ void renderScreen(Inkplate* displayPtr, display_item_t (* displayItemsPtr)[20], 
 
     renderDisplayItem(displayPtr, displayItem, i, renderTime);
   }
+}
+
+void renderSleepImage(Inkplate* displayPtr) {
+  displayPtr->clearDisplay();
+  displayPtr->drawBitmap3Bit(0, 50, cute_orange_cat_sleeping_clipa, cute_orange_cat_sleeping_clipa_w, cute_orange_cat_sleeping_clipa_h);
+  displayPtr->setFont(&Cheltenham_Condensed_Bold_Italic24pt7b);
+  displayPtr->setTextColor(BLACK);
+  displayPtr->setCursor(3, 50);
+  displayPtr->print("SEE YOU SPACE COWBOY ...");
+  displayPtr->setCursor(350, 790);
+  // can technically not be AM but let's be real
+  displayPtr->printf("... AT %d AM", NIGHT_TIME_END_HOUR);
 }

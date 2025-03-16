@@ -6,6 +6,8 @@
 #include <NTPClient.h>
 #include <WiFiUdp.h>
 #include <rom/rtc.h>       // Include ESP32 library for RTC (needed for rtc_get_reset_reason() function)
+#include <esp_wifi.h>
+#include "driver/adc.h"
 
 #include "config.h"
 #include "globals.h"
@@ -17,13 +19,14 @@
 
 #define MAX_PARTIAL_UPDATES 5
 
+#define uS_TO_S_FACTOR 1000000
+
 RTC_DATA_ATTR display_item_t displayItems[20];
 RTC_DATA_ATTR byte displayItemCount;
 RTC_DATA_ATTR time_t renderTime;
 RTC_DATA_ATTR float batteryVoltage;
 RTC_DATA_ATTR int rssi;
 RTC_DATA_ATTR byte numPartialUpdatesSinceClear;
-// TODO: use this
 RTC_DATA_ATTR time_t lastNTPSync;
 
 Inkplate display(INKPLATE_1BIT);
@@ -209,16 +212,25 @@ void setupJSONFilter() {
   filter_MonitoredVehicleJourney["MonitoredCall"]["ExpectedArrivalTime"] = true;
 }
 
-void setTimeFromNTP() {
-  // TODO: only update time once ~daily
-  timeClient.begin();
-  timeClient.update();
-
+void initTime() {
   // https://github.com/nayarsystems/posix_tz_db/blob/master/zones.csv
   setenv("TZ", "PST8PDT,M3.2.0,M11.1.0", 1);
   tzset();
 
-  display.rtcSetEpoch(timeClient.getEpochTime());
+  if (!display.rtcIsSet() || display.rtcGetEpoch() - lastNTPSync > (60 * 60 * 24)) {
+    Serial.println("Setting clock from NTP");
+    timeClient.begin();
+    bool ntpTimeUpdateSuccessful = timeClient.update();
+    time_t ntpEpochTime = timeClient.getEpochTime();
+    Serial.printf("pre-update RTC time %d, NTP time %d, NTP update result %d\n", display.rtcGetEpoch(), ntpEpochTime, ntpTimeUpdateSuccessful);
+
+    if (ntpTimeUpdateSuccessful) {
+      display.rtcSetEpoch(ntpEpochTime);
+      lastNTPSync = ntpEpochTime;
+    } else {
+      Serial.println("Couldn't fetch time from NTP, trying again next cycle.");
+    }
+  }
 
   time_t now = display.rtcGetEpoch();
   tm* local = localtime(&now);
@@ -268,10 +280,26 @@ void setAlarmForNextUpdate() {
   display.rtcDisableTimer();
   time_t currentTime = display.rtcGetEpoch();
   tm* timeStruct = localtime(&currentTime);
-  timeStruct->tm_sec = 0;
-  timeStruct->tm_min += 1;
+
+  if (isNightTime()) {
+    // this assumes that the night starts and ends on the same calendar day
+    timeStruct->tm_sec = 0;
+    timeStruct->tm_min = 0;
+    timeStruct->tm_hour = NIGHT_TIME_END_HOUR;
+  } else {
+    timeStruct->tm_sec = 0;
+    timeStruct->tm_min += 1;
+  }
   time_t alarmTime = mktime(timeStruct);
-  display.rtcSetAlarmEpoch(alarmTime, RTC_ALARM_MATCH_DHHMMSS);
+  int timeToSleep = alarmTime - currentTime;
+  if (timeToSleep < 0) {
+    timeToSleep = 10;
+  } else if (timeToSleep > 60) {
+    timeToSleep = 60;
+  }
+  // using this function instead of display.rtcSetAlarm() doesn't use the ext0 wakeup slot,
+  // so we can wake up by either timer or the wake button on the device
+  esp_sleep_enable_timer_wakeup(timeToSleep * uS_TO_S_FACTOR);
   Serial.printf("See ya in %d seconds! alarm: %d, current: %d\n", alarmTime - currentTime, alarmTime, currentTime);
 }
 
@@ -279,9 +307,41 @@ void callRenderFn() {
   renderScreen(&display, &displayItems, displayItemCount, renderTime, batteryVoltage, rssi);
 }
 
+void goToSleep() {
+  WiFi.disconnect();
+  WiFi.mode(WIFI_OFF);
+  // explicitly stoppping the wifi before deep sleeping supposedly reduces power a lot
+  // may have been fixed with newer arduino esp32 builds, but doesn't hurt to disable it twice
+  //adc_power_off();
+  esp_wifi_stop();
+  
+  setAlarmForNextUpdate();
+
+  Serial.flush();
+
+  // Enable wakeup from deep sleep on gpio 36 (wake button)
+  // ** this may increase power usage and isn't necessary, comment out for now
+  // esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, LOW);
+
+  // Go to sleep
+  esp_deep_sleep_start();
+}
+
+bool isNightTime() {
+  time_t currentTime = display.rtcGetEpoch();
+  tm* timeStruct = localtime(&currentTime);
+  int hour = timeStruct->tm_hour;
+
+  return hour >= NIGHT_TIME_START_HOUR && hour < NIGHT_TIME_END_HOUR;
+}
+
 void setup() {
   display.begin();
   Serial.begin(9600);
+  // we really don't need much cpu power for this, save the energy
+  setCpuFrequencyMhz(80);
+  display.setDisplayMode(INKPLATE_1BIT);
+  display.setRotation(3);
 
   bool shouldPartialUpdate = false;
   Serial.println("Initting...");
@@ -303,6 +363,18 @@ void setup() {
     numPartialUpdatesSinceClear = 0;
   }
 
+  if (isNightTime()) {
+    display.setDisplayMode(INKPLATE_3BIT);
+    renderSleepImage(&display);
+    display.display();
+
+    // set this to a high number so we do a full screen refresh next time
+    numPartialUpdatesSinceClear = 50;
+
+    setAlarmForNextUpdate();
+    goToSleep();
+  }
+
   setupJSONFilter();
   display.rtcClearAlarmFlag();
 
@@ -311,15 +383,24 @@ void setup() {
   memset(displayItems, 0, sizeof(displayItems));
   displayItemCount = 0;
 
+  esp_wifi_start();
   WiFi.begin(SSID, WIFI_PASS);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(1000);
+  short wifiTimeElapsed = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiTimeElapsed < 10000) {
+    delay(100);
+    wifiTimeElapsed += 100;
     Serial.print('.');
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("Couldn't connect to wifi after %d ms. Giving up.\n", wifiTimeElapsed);
+    goToSleep();
   }
   Serial.println(" connected!");
 
-  setTimeFromNTP();
+  // this occasionally pulls time fron NTP, so don't run it before we have a wifi connection
+  initTime();
 
+  // use http 1.0 so that the HTTP library doesn't add its own (broken) Accept-Encoding header
   http.useHTTP10(true);
   String stopFilter = concatInts(STOP_IDS, sizeof(STOP_IDS) / sizeof(int));
   String lineFilter = concatStrings(LINE_REFS, sizeof(LINE_REFS) / sizeof(char*));
@@ -330,12 +411,19 @@ void setup() {
   http.begin(URL);
   http.addHeader("Accept-Encoding", "identity", true, true);
   http.setTimeout(30 * 1000);
+
+  const char* headerKeys[] = {"x-filtered-visit-count"};
+  const size_t headerKeysCount = sizeof(headerKeys) / sizeof(headerKeys[0]);
+  http.collectHeaders(headerKeys, headerKeysCount);
+
   int responseCode = http.GET();
 
   int startTime = display.rtcGetEpoch();
 
   if (responseCode == HTTP_CODE_OK) {
-    // TODO: gather headers, make sure x-filtered-visit-count > 0
+    int numVisits = atoi(http.header("x-filtered-visit-count").c_str());
+    Serial.printf("Found %d visits\n", numVisits);
+
     WiFiClient payloadStream = http.getStream();
     ReadBufferingStream bufferedPayload(payloadStream, 256);
     Serial.println("Received response, parsing...");
@@ -343,20 +431,24 @@ void setup() {
     bufferedPayload.find("\"MonitoredStopVisit\":[");
     StaticJsonDocument<512> currentArrival;
     int numArrivalsDeserialized = 0;
-    do {
-      deserializeJson(currentArrival, bufferedPayload, DeserializationOption::Filter(filter));
+    if (numVisits > 0) {
+      do {
+        deserializeJson(currentArrival, bufferedPayload, DeserializationOption::Filter(filter));
 
-      const char* stopId = currentArrival["MonitoringRef"];
-      const char* lineRef = currentArrival["MonitoredVehicleJourney"]["LineRef"];
+        const char* stopId = currentArrival["MonitoringRef"];
+        const char* lineRef = currentArrival["MonitoredVehicleJourney"]["LineRef"];
 
-      if (stopIsDesired(stopId) && lineIsDesired(lineRef)) {
-        addArrivalToArray(currentArrival);
-      }
-      numArrivalsDeserialized++;
-      if (numArrivalsDeserialized % 100 == 0) {
-        Serial.printf("Deserialized %d arrivals so far\n", numArrivalsDeserialized);
-      }
-    } while (bufferedPayload.findUntil(",", "]"));
+        if (stopIsDesired(stopId) && lineIsDesired(lineRef)) {
+          addArrivalToArray(currentArrival);
+        }
+        numArrivalsDeserialized++;
+        if (numArrivalsDeserialized % 100 == 0) {
+          Serial.printf("Deserialized %d arrivals so far\n", numArrivalsDeserialized);
+        }
+      } while (bufferedPayload.findUntil(",", "]"));
+    } else {
+      Serial.println("No visits to load, skipping json parsing");
+    }
 
     sortDisplayItems();
 
@@ -376,24 +468,10 @@ void setup() {
   } else {
     Serial.printf("Got HTTP error: %s\n", http.errorToString(responseCode));
   }
-  WiFi.disconnect();
-
   Serial.printf("Downloaded and processed JSON in %d seconds\n", display.rtcGetEpoch() - startTime);
-  
-  setAlarmForNextUpdate();
-
-  Serial.flush();
   free(URL);
 
-  // Enable wakeup from deep sleep on gpio 39 where RTC interrupt is connected
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_39, 0);
-
-  // Enable wakeup from deep sleep on gpio 36 (wake button)
-  // TODO: seems like only one wakeup source can be enabled at a time
-  //esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, LOW);
-
-  // Go to sleep
-  esp_deep_sleep_start();
+  goToSleep();
 }
 
 void loop() {}
