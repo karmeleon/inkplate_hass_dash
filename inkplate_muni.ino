@@ -304,9 +304,8 @@ void setAlarmForNextUpdate() {
   } else if (timeToSleep > 60 && !isNight) {
     timeToSleep = 60;
   }
-  // using this function instead of display.rtcSetAlarm() doesn't use the ext0 wakeup slot,
-  // so we can wake up by either timer or the wake button on the device
-  esp_sleep_enable_timer_wakeup(timeToSleep * uS_TO_S_FACTOR);
+  // cast to uint64 to prevent an integer overflow
+  esp_sleep_enable_timer_wakeup(((uint64_t)timeToSleep) * uS_TO_S_FACTOR);
   Serial.printf("See ya in %d seconds! alarm: %d, current: %d\n", timeToSleep, alarmTime, currentTime);
 }
 
@@ -381,7 +380,6 @@ void setup() {
     // set this to a high number so we do a full screen refresh next time
     numPartialUpdatesSinceClear = 50;
 
-    setAlarmForNextUpdate();
     goToSleep();
   }
 
