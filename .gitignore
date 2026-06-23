@@ -1,2 +1,6 @@
-config.h
+src/config.h
 .DS_Store
+src/config.h
+.pio
+.vscode/
+!.vscode/extensions.json
