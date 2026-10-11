@@ -176,7 +176,10 @@ void setup() {
     Serial.print('.');
   }
   if (WiFi.status() != WL_CONNECTED) {
-    log_e("Couldn't connect to wifi after %d ms. Giving up.\n", wifiTimeElapsed);
+    char debug_str[64];
+    snprintf(debug_str, sizeof(debug_str), "Couldn't connect to wifi after %d ms. Giving up.\n", wifiTimeElapsed);
+    log_e("%s", debug_str);
+    display.drawTextBox(0, 0, 480, 480, debug_str, 4);
     goToSleep();
   }
   Serial.println(" connected!");
@@ -184,11 +187,15 @@ void setup() {
   maybeUpdateTimeFromNTP();
 
   // download and draw our image
-  display.image.draw(IMAGE_URL, 0, 0, false, false);
-  log_d("drawn image to buffer, displaying now");
+  // you'll need to change the function here if you want to draw another image format
+  bool success = display.image.drawPngFromWeb(IMAGE_URL, 0, 0, false, false);
+  if (success) {
+    log_d("drawn image to buffer, displaying now");
+  } else {
+    display.drawTextBox(0, 0, 480, 480, "failed to draw image :( can you curl the endpoint successfully?", 4);
+  }
   display.display();
 
-  log_d("image drawn!");
 
   #ifdef WEBHOOK_URL
   log_d("Posting data to webhook");
